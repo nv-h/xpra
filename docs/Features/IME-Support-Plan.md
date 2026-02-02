@@ -16,16 +16,7 @@ does not work at all. Neither client-side nor server-side input methods are func
 
 ## 2. Root Cause Analysis
 
-### 2.1 keyboard-sync is unrelated
-
-`--keyboard-sync` only controls key repeat behavior:
-- `sync=True`: server holds key-down state and manages repeat
-- `sync=False`: client manages repeat; server does immediate press/release
-
-It has no involvement in the IME input pipeline.
-Relevant code: `xpra/server/subsystem/keyboard.py` `_handle_key()`
-
-### 2.2 Three Structural Issues
+### 2.1 Three Structural Issues
 
 #### A. Client-side: GTK event handlers consume all key events
 
@@ -56,7 +47,7 @@ sees these events.
 Xpra windows do not use `GtkIMContext`. There is no protocol for preedit
 (composition display), commit (finalized string), or surrounding text.
 
-### 2.3 Existing IBus Code
+### 2.2 Existing IBus Code
 
 The following files contain IBus-related code, but only for daemon management
 and layout querying - not for IME event processing:
@@ -119,7 +110,21 @@ GtkIMContext.filter_keypress()
       keyboard-event packet ----> Normal key processing (unchanged)
 ```
 
-### 4.2 Files to Modify
+### 4.2 Capability Negotiation
+
+Both client and server advertise IME support via the existing capability exchange:
+
+- **Server** `get_caps()`: adds `"ime-commit": True`
+- **Client** `get_caps()`: adds `"ime-commit": True`
+- Client checks server caps before sending `IME_COMMIT` packets
+  (prevents sending unknown packets to older servers)
+- Server checks client caps before sending IME-related packets
+  (for future preedit extensions)
+
+This follows the existing pattern in `server/subsystem/keyboard.py` `get_caps()`
+(L108-115) and `parse_hello()` (L117-119).
+
+### 4.3 Files to Modify
 
 #### Protocol Layer
 - `xpra/net/packet_type.py` - Add `IME_COMMIT` packet type constant
@@ -135,27 +140,85 @@ GtkIMContext.filter_keypress()
 #### Server Side
 - `xpra/server/subsystem/keyboard.py`
   - Add `_process_ime_commit` handler
-  - Register packet handler in `init_packet_handlers`
+  - Register packet handler in `init_packet_handlers` with `main_thread=True`
   - Implement Unicode string injection logic
 
-### 4.3 Server-Side Unicode Character Injection
+### 4.4 Server-Side Unicode Character Injection
 
 XTest only accepts **keycodes** (`XTestFakeKeyEvent`).
 Japanese characters are not in the default keymap, so the following steps are needed:
 
-1. Look up Unicode keysym (`0x01000000 + codepoint`) via `KeysymToKeycodes()`
-2. If not found, find an unused keycode
-3. Temporarily map the Unicode keysym via `XChangeKeyboardMapping`
-4. Press/release the keycode via `XTestFakeKeyEvent`
-5. Restore the keymap
+#### Injection Algorithm
 
-Existing infrastructure:
-- `xpra/x11/bindings/keyboard.pyx` `xmodmap_setkeycodes()` already wraps
-  `XChangeKeyboardMapping`
-- `xpra/x11/bindings/keyboard.pyx` `KeysymToKeycodes()` provides
-  keysym → keycode reverse lookup
+For a commit string (e.g. "こんにちは", 5 characters):
 
-### 4.4 Out of Scope (not included in this PR)
+1. Compute Unicode keysyms for all characters (`0x01000000 + codepoint`)
+2. For each keysym, check if a keycode already exists via `KeysymToKeycodes()`
+3. Collect unmapped keysyms that need temporary keycode assignment
+4. Find unused keycodes by scanning with `get_keysym_mappings()` (keyboard.pyx:687-696)
+   - Keycodes where all keysym slots are `NoSymbol` are considered unused
+   - Pool up to 8 unused keycodes for batch assignment
+5. Suppress keymap change notifications by setting `keymap_changing_timer`
+   (reuses existing pattern from `x11/subsystem/keyboard.py` L325-338)
+6. Batch-assign all unmapped keysyms to unused keycodes via `XChangeKeyboardMapping`
+   (**single call**, not per-character)
+7. Call `XFlush` to ensure the mapping change reaches the X server
+8. Loop through all characters: `XTestFakeKeyEvent` press/release for each
+9. Restore original keymap via `XChangeKeyboardMapping` (**single call**)
+10. Re-enable keymap change notifications via timer (existing pattern)
+
+This results in at most **2 `XChangeKeyboardMapping` calls** regardless of string length.
+If all characters already have keycodes (e.g. ASCII), no keymap changes are needed.
+
+#### Unused Keycode Discovery
+
+Dynamic scan approach using public APIs:
+- `get_keysym_mappings()` returns `{keysym: [keycodes]}` for all mapped keysyms
+- `get_minmax_keycodes()` (keyboard.pyx:532-535) returns the valid keycode range (typically 8-255)
+- Keycodes not appearing in any keysym mapping are unused
+- Pool size of 8 covers typical IME commits (a few to ~10 characters)
+- If more than 8 unmapped characters exist, process in multiple rounds
+
+Note: `_get_raw_keycode_mappings()` is a `cdef` method (not callable from Python).
+Use the public `get_keycode_mappings()` (keyboard.pyx:698-709) or
+`get_keysym_mappings()` (keyboard.pyx:687-696) instead.
+
+#### Keymap Change Race Condition Handling
+
+`XChangeKeyboardMapping` triggers asynchronous `MappingNotify` events, which
+would cause xpra's `keymap_changed()` handler (server/subsystem/keyboard.py:75-78)
+to fire and propagate unnecessary keymap updates to clients.
+
+Mitigation (reusing existing pattern from `x11/subsystem/keyboard.py:325-338`):
+1. Set `keymap_changing_timer` to a non-zero value before injection
+   - While non-zero, `_keys_changed()` (L378-383) is suppressed
+2. Perform the injection within an `xsync` block for X11 error handling
+3. Call `XFlush` (keyboard.pyx:354) after keymap changes to flush the X11 request buffer
+   - Note: `XSync` is not directly exposed in xpra's Cython bindings;
+     `XFlush` is sufficient as we only need to ensure the server processes
+     the mapping change before we inject key events
+4. After injection, restore the keymap and schedule `keymap_changing_timer`
+   to re-enable change notifications (via `GLib.timeout_add`, same as `set_keymap()`)
+
+#### Thin Wrapper vs Reusing xmodmap_setkeycodes()
+
+`xmodmap_setkeycodes()` (keyboard.pyx:589-646) wraps `XChangeKeyboardMapping`
+but has a complex interface designed for full keymap configuration (handles
+`new_keysyms` redistribution, missing keysym reporting, etc.).
+
+For IME injection, a simpler dedicated wrapper is preferred:
+- Takes a `{keycode: keysym}` mapping
+- Calls `XChangeKeyboardMapping` directly
+- No modifier or redistribution logic needed
+
+#### Thread Safety
+
+The IME commit handler must be registered with `main_thread=True` in
+`init_packet_handlers()`, matching all other keyboard packet handlers.
+This ensures `XChangeKeyboardMapping` and `XTestFakeKeyEvent` execute on
+the same GLib main thread that owns the X11 connection.
+
+### 4.5 Out of Scope (not included in this PR)
 
 - **Preedit display**: Rendering IME composition candidates on the remote screen.
   The client-side OS IME candidate window will display locally as-is.
@@ -178,18 +241,20 @@ Steps:
    - Connects to X11 display
    - Finds an unused keycode
    - Maps Unicode keysym (0x01000000 + ord('あ')) via XChangeKeyboardMapping
+   - Calls XFlush
    - Presses/releases via XTestFakeKeyEvent
    - Verify 'あ' appears in xterm
 ```
 
-Success → proceed to Phase 1.
-Failure → fall back to xdotool subprocess approach.
+If this fails, the X11 server does not support Unicode keysym injection.
+This is unlikely on modern X servers but would mean IME support requires
+a fundamentally different approach (out of scope for this PR).
 
 ### Phase 1: Server-Side IME_COMMIT Handler (Ubuntu)
 
 Changes:
 - `packet_type.py`: add packet definition
-- `server/subsystem/keyboard.py`: add handler
+- `server/subsystem/keyboard.py`: add handler with `main_thread=True`
 
 Test:
 ```
@@ -236,6 +301,7 @@ Step 2b: Send commit strings as IME_COMMIT packets
 | File | Role |
 |------|------|
 | `xpra/server/subsystem/keyboard.py` | Packet processing pipeline |
+| `xpra/x11/subsystem/keyboard.py` | X11 keyboard subsystem, keymap change suppression pattern |
 | `xpra/x11/server/keyboard_config.py` | X11 keycode translation |
 | `xpra/x11/server/xtest_keyboard.py` | XTest device wrapper |
 | `xpra/x11/bindings/keyboard.pyx` | X11 keyboard bindings (Cython) |
